@@ -59,7 +59,7 @@ run_job_sequentially:
         assign:
           - execution_name: ${job_execution_op.metadata.name}
 
-    # Cloud Run Jobs are async. We must poll until it finishes.
+    # Cloud Run Jobs are async. We must poll until it finishes. just a test
     - wait_loop:
         call: sys.sleep
         args:

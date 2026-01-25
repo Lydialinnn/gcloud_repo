@@ -5,7 +5,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def hello_world():
-    # This print statement will show up in Cloud Logging
+    # This print statement will show up in Cloud Logging, just a test
     print("LOG: Request received! Processing data...")
     
     # This string is returned to the caller (Browser or curl)
