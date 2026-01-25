@@ -1,0 +1,91 @@
+main:
+  params: [args]
+  steps:
+    - init:
+            assign:
+            - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+            - location: "northamerica-northeast2"
+            - job_name: "valor-shopify-details-etl-job"
+            - batch_offsets: [0, 20, 40, 60, 80, 100] 
+
+    - process_batches:
+        for:
+          value: offset
+          in: ${batch_offsets}
+          steps:
+            - log_start:
+                call: sys.log
+                args:
+                  text: ${"Starting batch with offset " + string(offset)}
+                  severity: "INFO"
+
+            - run_job_and_wait:
+                call: run_job_sequentially
+                args:
+                  project_id: ${project_id}
+                  location: ${location}
+                  job_name: ${job_name}
+                  offset_val: ${offset}
+
+            - log_end:
+                call: sys.log
+                args:
+                  text: ${"Finished batch with offset " + string(offset)}
+                  severity: "INFO"
+
+    - finish:
+        return: "All batches completed successfully."
+
+# --- Subworkflow to Run Job and Poll for Completion ---
+run_job_sequentially:
+  params: [project_id, location, job_name, offset_val]
+  steps:
+    - trigger_job:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name: ${"namespaces/" + project_id + "/jobs/" + job_name}
+          location: ${location}
+          body:
+            overrides:
+              containerOverrides:
+                - args: 
+                    - "--days_to_fetch"
+                    - "20"
+                    - "--offset_days"
+                    - ${string(offset_val)} # Pass the current loop value
+        result: job_execution_op
+
+    - get_execution_name:
+        assign:
+          - execution_name: ${job_execution_op.metadata.name}
+
+    # Cloud Run Jobs are async. We must poll until it finishes.
+    - wait_loop:
+        call: sys.sleep
+        args:
+          seconds: 300 # Check status every 30 seconds
+
+    - check_status:
+        call: googleapis.run.v1.namespaces.executions.get
+        args:
+          name: ${"namespaces/" + project_id + "/executions/" + execution_name}
+          location: ${location}
+        result: execution_details
+
+    - analyze_status:
+        switch:
+          # If completionTime is present, the job finished (success or fail)
+          - condition: ${"completionTime" in execution_details.status}
+            next: verify_success
+          # If not, loop back and wait again
+          - condition: ${true}
+            next: wait_loop
+
+    - verify_success:
+        switch:
+          # Check if the job actually succeeded (succeededCount > 0)
+          - condition: ${execution_details.status.succeededCount > 0}
+            return: "Success"
+          - condition: ${true}
+            raise: 
+              message: ${"Job failed for offset " + string(offset_val)}

@@ -1,0 +1,10 @@
+requests
+pandas
+pytz
+google-cloud-bigquery
+google-cloud-secret-manager
+urllib3
+pyarrow
+pandas-gbq
+db-dtypes
+tenacity
