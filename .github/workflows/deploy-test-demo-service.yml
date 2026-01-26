@@ -27,12 +27,12 @@ jobs:
           # 1. Move into the service subfolder
           cd cloud-run-services/test-demo-service
           
-          # 2. Deploy as a Cloud Run SERVICE (not a job)
+          # 2. Deploy as a Cloud Run SERVICE (not a job) # allow-unauthenticated
           gcloud run deploy test-demo-service \
             --project=${{ secrets.GCP_PROJECT_ID }} \
             --region=northamerica-northeast2 \
             --source . \
             --memory=2Gi \
             --service-account=valor-scheduler-invoker@valor-sales.iam.gserviceaccount.com \
-            --allow-unauthenticated \
+            --no-allow-unauthenticated \
             --set-env-vars="GCP_PROJECT_ID=valor-sales,SECRET_NAME=valor_shopify_cred"
