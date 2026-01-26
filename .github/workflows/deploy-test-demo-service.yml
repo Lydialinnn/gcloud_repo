@@ -1,0 +1,37 @@
+name: Deploy Test Demo Service
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'cloud-run-services/test-demo-service/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Google Auth
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+
+      - name: 'Build and Deploy'
+        run: |
+          # 1. Move into the service subfolder
+          cd cloud-run-services/test-demo-service
+          
+          # 2. Deploy as a Cloud Run SERVICE (not a job)
+          gcloud run deploy test-demo-service \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --region=northamerica-northeast2 \
+            --source . \
+            --memory=2Gi \
+            --service-account=valor-scheduler-invoker@valor-sales.iam.gserviceaccount.com \
+            --allow-unauthenticated \
+            --set-env-vars="GCP_PROJECT_ID=valor-sales,SECRET_NAME=valor_shopify_cred"
