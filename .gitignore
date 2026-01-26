@@ -1,0 +1,20 @@
+# macOS system files
+.DS_Store
+**/.DS_Store
+
+# Personal comment/note files
+# Add your specific file names here
+some_setup.bash
+
+# Python caches and virtual environments
+# __pycache__/
+# *.py[cod]
+# *$py.class
+# venv/
+# .venv/
+# env/
+
+# # IDE settings
+# .vscode/
+# .idea/
+
