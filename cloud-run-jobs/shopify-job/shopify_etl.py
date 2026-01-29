@@ -11,9 +11,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from google.cloud import bigquery
 from google.cloud import secretmanager
-# from flask import Flask, request
-import argparse
-import sys
+from flask import Flask, request
 import uuid
 
 # --- NEW IMPORTS FOR RETRY LOGIC ---
@@ -28,7 +26,7 @@ from tenacity import (
 )
 
 
-# app = Flask(__name__)
+app = Flask(__name__)
 
 # --- GCP Configuration ---
 GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
@@ -59,7 +57,98 @@ def get_secret(project_id, secret_id, version_id="latest"):
     response = client.access_secret_version(request={"name": name})
     return response.payload.data.decode("UTF-8")
 
+@app.route('/', methods=['POST'])
+def main_handler_wrapper():
+    """Triggered by Cloud Scheduler via HTTP POST."""
+    logger.info("HTTP request received. Starting job.")
+    return main_handler(None, None)
 
+def main_handler(event, context):
+    logger.info("--- Starting Shopify to BigQuery Job (Dynamic Chunk Version) ---")
+
+    # 1. Parse Arguments from Cloud Scheduler (JSON Payload)
+    # If triggered manually without payload, it defaults to: 
+    # Fetch 20 days, starting from yesterday (Offset 0)
+    try:
+        json_payload = request.get_json(silent=True) or {}
+    except:
+        json_payload = {}
+        
+    # Default to 20 days if not specified
+    days_to_fetch = json_payload.get('days_to_fetch', 20) 
+    # Default to 0 (start from yesterday) if not specified
+    offset_days = json_payload.get('offset_days', 0)
+    
+    logger.info(f"Configuration: Fetching {days_to_fetch} days, starting {offset_days} days ago.")
+
+    try:
+        api_token = get_secret(GCP_PROJECT_ID, SECRET_NAME)
+        headers = {'X-Shopify-Access-Token': api_token.strip()}
+    except Exception as e:
+        logger.error(f"FATAL: Could not retrieve API secret. Error: {e}")
+        return "Error fetching secret", 500
+
+    # 2. Date Calculation (Toronto Time)
+    toronto_tz = pytz.timezone("America/Toronto")
+    
+    # Use UTC for the timestamp
+    run_timestamp = datetime.now(timezone.utc).isoformat()
+    
+    today_toronto = datetime.now(toronto_tz).date()
+    yesterday_toronto = today_toronto - timedelta(days=1)
+    
+    # --- DYNAMIC DATE LOGIC (fixed) ---
+    if offset_days == 0:
+        # Latest Batch: Ends Yesterday
+        end_date_toronto = yesterday_toronto
+    else:
+        # Historical Batch: Ends Yesterday - Offset - 1 Day
+        # The -1 is crucial to avoid touching the date handled by the previous batch
+        end_date_toronto = yesterday_toronto - timedelta(days=offset_days + 1)
+
+    # API Request timestamps (Still needed for the API call itself)
+    start_date_toronto = end_date_toronto - timedelta(days=days_to_fetch)
+
+    # --- STRICT BOUNDARIES FOR STAGING ---
+    # These strings will be used to filter the DataFrame manually
+    strict_min_date = start_date_toronto.strftime('%Y-%m-%d')
+    strict_max_date = end_date_toronto.strftime('%Y-%m-%d')
+    
+    logger.info(f"STRICT STAGING BOUNDARIES: {strict_min_date} to {strict_max_date}")
+
+    
+
+
+    created_at_min_toronto = datetime.combine(start_date_toronto, datetime.min.time(), tzinfo=toronto_tz)
+    created_at_max_toronto = datetime.combine(end_date_toronto, datetime.max.time(), tzinfo=toronto_tz)
+
+    created_at_min_utc = created_at_min_toronto.astimezone(pytz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    created_at_max_utc = created_at_max_toronto.astimezone(pytz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    logger.info(f"Fetching orders from (Toronto): {created_at_min_toronto} to {created_at_max_toronto}")
+    logger.info(f"Run Timestamp: {run_timestamp}")
+
+    # 3. Fetch and Load in Chunks  (Pass strict dates)
+    try:
+        # --- CHANGE: Unpack the extra return values ---
+        rows_items, rows_full, actual_min_date, actual_max_date, temp_table_items, temp_table_fulfill = fetch_and_load_in_chunks(
+            headers, created_at_min_utc, created_at_max_utc, run_timestamp, offset_days,
+            strict_min_date, strict_max_date 
+        )
+    except Exception as e:
+        logger.error(f"CRITICAL JOB FAILURE: {e}")
+        return f"Job Failed: {e}", 500
+
+    if rows_items == 0 and rows_full == 0:
+        logger.info("No new data found. Exiting.")
+        return "No data processed", 200
+
+    logger.info(f"--- Staging complete! Data Range: {actual_min_date} to {actual_max_date} ---")
+
+    # 4. Run Merge/Update SQL
+    run_bigquery_chained_operations(temp_table_items, temp_table_fulfill) 
+
+    return "Success", 200
 
 def fetch_and_load_in_chunks(headers, min_date_str, max_date_str, run_timestamp, offset_days, strict_min_date, strict_max_date):
     """
@@ -144,7 +233,7 @@ def fetch_and_load_in_chunks(headers, min_date_str, max_date_str, run_timestamp,
                 
                 initial_count = len(df_items)
                 
-                df_items = df_items[ (df_items['order_date'] >= strict_min_date) &  (df_items['order_date'] <= strict_max_date) ]
+                # df_items = df_items[ (df_items['order_date'] >= strict_min_date) &  (df_items['order_date'] <= strict_max_date) ]
                 
                 filtered_count = len(df_items)
                 if filtered_count < initial_count:
@@ -340,7 +429,7 @@ def process_valor_orders_data(order_data, run_timestamp):
             }
             order_item_detail.append(order_item)
 
-        # Fulfillments
+        # Fulfillments --- UPDATED
         for fulfillment in order.get('fulfillments', []):
             if not isinstance(fulfillment, dict) or fulfillment.get('status') != 'success':
                 continue
@@ -348,6 +437,10 @@ def process_valor_orders_data(order_data, run_timestamp):
             for item in fulfillment.get('line_items', []):
                 order_item_fulfilled.append({
                     'fulfilled_at': fulfillment.get('created_at'),
+                    'fulfillment_id': str(fulfillment.get('id')), # new added
+                    'name': fulfillment.get('name'), # new added
+                    'order_id': str(fulfillment.get('order_id')), # new added
+                    'sku': item.get('sku'), # new added
                     'line_item_id': str(item.get('id', '')),
                     'fulfilled_sku_qty': int(item.get('quantity', 0)),
                     'fulfilled_status': item.get('fulfillment_status'),
@@ -377,7 +470,7 @@ def process_valor_orders_data(order_data, run_timestamp):
 
 def run_bigquery_chained_operations(temp_table_items, temp_table_full):
     """
-    1. DELETE overlaps (Window Refresh).
+    1. DELETE overlaps (ID-BASED).
     2. INSERT new data.
     3. CONDITIONAL SAFETY NET: Checks for duplicates. Only runs dedup if found.
     """
@@ -394,14 +487,15 @@ def run_bigquery_chained_operations(temp_table_items, temp_table_full):
         BEGIN TRANSACTION;
             
             -- =================================================================
-            -- 1. ORDER ITEMS: Standard Window Refresh
+            -- 1. ORDER ITEMS: ** updated to ID-BASED (Safe from Timezone Glitches), but need to check order_deletions later ** 
             -- =================================================================
             
             -- A. Delete existing records in Main that overlap with DATES in Temp
             DELETE FROM `{main_table_items}` T
-            WHERE T.order_date IN (SELECT DISTINCT SAFE_CAST(order_date AS DATE) FROM `{temp_table_items}`);
+            WHERE T.order_id IN (SELECT DISTINCT order_id FROM `{temp_table_items}`);
 
             -- B. Insert new records from Temp
+            -- ensures that if the API sent duplicates in this batch,  only pick the most recent one
             INSERT INTO `{main_table_items}` (
                 order_date, cancel_at, order_name, order_id, financial_status, 
                 order_tag, order_note, discount_code, line_item_id, sku, 
@@ -423,69 +517,28 @@ def run_bigquery_chained_operations(temp_table_items, temp_table_full):
                 shipping_geocoding, order_fulfillment_status, 
                 SAFE_CAST(order_total_discounts AS FLOAT64),
                 SAFE_CAST(last_updated_at AS TIMESTAMP)
-            FROM `{temp_table_items}`;
+            FROM `{temp_table_items}`
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY line_item_id ORDER BY last_updated_at DESC) = 1;
+
 
             -- =================================================================
-            -- 2. CONDITIONAL SAFETY NET
-            --    First, check if duplicates actually exist in the affected dates.
-            -- =================================================================
-            
-            SET dup_count = (
-                SELECT COUNT(1)
-                FROM (
-                    SELECT line_item_id
-                    FROM `{main_table_items}`
-                    WHERE order_date IN (SELECT DISTINCT SAFE_CAST(order_date AS DATE) FROM `{temp_table_items}`)
-                    GROUP BY line_item_id
-                    HAVING COUNT(*) > 1
-                )
-            );
-
-            -- Only run the heavy cleanup IF we found duplicates
-            IF dup_count > 0 THEN
-            
-                -- C. Create clean staging from Main 
-                CREATE TEMP TABLE clean_stage AS
-                SELECT * EXCEPT(rn)
-                FROM (
-                    SELECT *,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY line_item_id 
-                        ORDER BY last_updated_at DESC
-                    ) as rn
-                    FROM `{main_table_items}`
-                    WHERE order_date IN (SELECT DISTINCT SAFE_CAST(order_date AS DATE) FROM `{temp_table_items}`)
-                )
-                WHERE rn = 1;
-
-                -- D. Wipe the affected dates from Main completely
-                DELETE FROM `{main_table_items}`
-                WHERE order_date IN (SELECT DISTINCT SAFE_CAST(order_date AS DATE) FROM `{temp_table_items}`);
-
-                -- E. Insert the clean, unique rows back in
-                INSERT INTO `{main_table_items}`
-                SELECT * FROM clean_stage;
-                
-                DROP TABLE IF EXISTS clean_stage;
-                
-            END IF;
-
-            -- =================================================================
-            -- 3. FULFILLMENTS UPDATE (Standard Logic)
+            -- 2. FULFILLMENTS UPDATE (Standard Logic) ** new update to include new extracted columns**
             -- =================================================================
             
             DELETE FROM `{main_table_full}` T
-            WHERE T.line_item_id IN (SELECT DISTINCT line_item_id FROM `{temp_table_items}`);
+            WHERE T.line_item_id IN (SELECT DISTINCT line_item_id FROM `{temp_table_full}`);
 
             INSERT INTO `{main_table_full}` (
-                fulfilled_at, line_item_id, fulfilled_sku_qty, 
+                fulfilled_at, fulfillment_id, name, order_id, sku,
+                line_item_id, fulfilled_sku_qty, 
                 fulfilled_status, last_updated_at
             )
             SELECT 
-                SAFE_CAST(fulfilled_at AS DATE),
+                SAFE_CAST(fulfilled_at AS DATE),fulfillment_id, name, order_id, sku,
                 line_item_id, fulfilled_sku_qty, 
                 fulfilled_status, SAFE_CAST(last_updated_at AS TIMESTAMP)
-            FROM `{temp_table_full}`;
+            FROM `{temp_table_full}`
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY line_item_id, fulfillment_id ORDER BY last_updated_at DESC) = 1;
 
         COMMIT TRANSACTION;
 
@@ -504,78 +557,5 @@ def run_bigquery_chained_operations(temp_table_items, temp_table_full):
         logger.error(f"Failed to execute BigQuery job: {e}")
         raise e
 
-# --- MAIN ENTRY POINT (Replaces Flask App) ---
 if __name__ == "__main__":
-    logger.info("--- Starting Shopify to BigQuery Job (Cloud Run Job Mode) ---")
-
-    # 1. Parse Arguments (Replaces request.get_json())
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--days_to_fetch', type=int, default=20)
-    parser.add_argument('--offset_days', type=int, default=0)
-    args = parser.parse_args()
-
-    days_to_fetch = args.days_to_fetch
-    offset_days = args.offset_days
-    
-    logger.info(f"Configuration: Fetching {days_to_fetch} days, starting {offset_days} days ago.")
-
-    try:
-        api_token = get_secret(GCP_PROJECT_ID, SECRET_NAME)
-        headers = {'X-Shopify-Access-Token': api_token.strip()}
-    except Exception as e:
-        logger.error(f"FATAL: Could not retrieve API secret. Error: {e}")
-        sys.exit(1) # Exit with error
-
-    # 2. Date Calculation (Toronto Time)
-    toronto_tz = pytz.timezone("America/Toronto")
-    run_timestamp = datetime.now(timezone.utc).isoformat()
-    today_toronto = datetime.now(toronto_tz).date()
-    yesterday_toronto = today_toronto - timedelta(days=1)
-    
-    if offset_days == 0:
-        end_date_toronto = yesterday_toronto
-    else:
-        end_date_toronto = yesterday_toronto - timedelta(days=offset_days + 1)
-
-    start_date_toronto = end_date_toronto - timedelta(days=days_to_fetch)
-
-    # Strict Boundaries
-    strict_min_date = start_date_toronto.strftime('%Y-%m-%d')
-    strict_max_date = end_date_toronto.strftime('%Y-%m-%d')
-    
-    logger.info(f"STRICT STAGING BOUNDARIES: {strict_min_date} to {strict_max_date}")
-
-    created_at_min_toronto = datetime.combine(start_date_toronto, datetime.min.time(), tzinfo=toronto_tz)
-    created_at_max_toronto = datetime.combine(end_date_toronto, datetime.max.time(), tzinfo=toronto_tz)
-
-    created_at_min_utc = created_at_min_toronto.astimezone(pytz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    created_at_max_utc = created_at_max_toronto.astimezone(pytz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-
-    logger.info(f"Fetching orders from (Toronto): {created_at_min_toronto} to {created_at_max_toronto}")
-    logger.info(f"Run Timestamp: {run_timestamp}")
-
-    # 3. Fetch and Load
-    try:
-        rows_items, rows_full, actual_min_date, actual_max_date, temp_table_items, temp_table_fulfill = fetch_and_load_in_chunks(
-            headers, created_at_min_utc, created_at_max_utc, run_timestamp, offset_days,
-            strict_min_date, strict_max_date 
-        )
-    except Exception as e:
-        logger.error(f"CRITICAL JOB FAILURE: {e}")
-        sys.exit(1) # Exit with error
-
-    if rows_items == 0 and rows_full == 0:
-        logger.info("No new data found. Exiting.")
-        sys.exit(0) # Successful exit
-
-    logger.info(f"--- Staging complete! Data Range: {actual_min_date} to {actual_max_date} ---")
-
-    # 4. Run Merge/Update SQL
-    try:
-        run_bigquery_chained_operations(temp_table_items, temp_table_fulfill)
-    except Exception as e:
-        logger.error(f"SQL Merge failed: {e}")
-        sys.exit(1)
-
-    logger.info("Job Completed Successfully.")
-    sys.exit(0) # Successful exit
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
